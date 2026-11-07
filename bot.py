@@ -10,10 +10,20 @@ logging.getLogger("httpx").setLevel(logging.WARNING)   # keep the bot token out 
 APP_ID = "34SRQBBtI5nwEFQqmc3se"   # hardcoded
 MAX_STAKE = 5000              # cap for the base stake
 MAX_MART_STAKE = 1000000      # hidden safety cap on martingale stakes
-TG_TOKEN = os.environ["TG_TOKEN"]
+
+# Bot token: works with TG_TOKEN or the names FadeHost provides
+TG_TOKEN = (os.environ.get("TG_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+            or os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+            or os.environ.get("TOKEN"))
+if not TG_TOKEN:
+    raise SystemExit("Missing bot token. Set TG_TOKEN in the host settings.")
+
 API = "https://api.derivws.com/trading/v1/options"
-DB = os.path.expanduser("~/.deriv_bot_users.json")
-KEY_FILE = os.path.expanduser("~/.deriv_bot_key")
+
+# Data folder: the bot's own folder (writable on FadeHost), or DATA_DIR if set
+DATA_DIR = os.environ.get("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+DB = os.path.join(DATA_DIR, ".deriv_bot_users.json")
+KEY_FILE = os.path.join(DATA_DIR, ".deriv_bot_key")
 
 # ---- Virtual mode account (hardcoded demo account) ----
 VIRTUAL_PAT = "pat_0cfa7f96d364eb299f47ea5e5fbdc2a5fff787ab85cdab4342e92e0b98fd0653"
@@ -64,17 +74,40 @@ def load_key():
     k = os.environ.get("DB_KEY")
     if k:
         return k.encode()
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE, "rb") as f:
-            return f.read().strip()
+    try:
+        if os.path.exists(KEY_FILE):
+            with open(KEY_FILE, "rb") as f:
+                return f.read().strip()
+    except OSError:
+        pass
     k = Fernet.generate_key()
-    with open(KEY_FILE, "wb") as f:
-        f.write(k)
-    os.chmod(KEY_FILE, 0o600)
+    try:
+        with open(KEY_FILE, "wb") as f:
+            f.write(k)
+        os.chmod(KEY_FILE, 0o600)
+    except OSError:
+        logging.warning("Could not save key file. Set the DB_KEY variable.")
     return k
 
 
 FERNET = Fernet(load_key())
+
+
+def load_db():
+    try:
+        with open(DB) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_db(db):
+    with open(DB, "w") as f:
+        json.dump(db, f)
+    try:
+        os.chmod(DB, 0o600)
+    except OSError:
+        pass
 
 
 def get_creds(uid):
@@ -90,20 +123,6 @@ def get_creds(uid):
 
 def norm(text):
     return TYPE_LOOKUP.get(text.strip().lower())
-
-
-def load_db():
-    try:
-        with open(DB) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_db(db):
-    with open(DB, "w") as f:
-        json.dump(db, f)
-    os.chmod(DB, 0o600)
 
 
 def hdr(pat):
@@ -163,7 +182,14 @@ async def got_acc(update, ctx):
     acc = update.message.text.strip()
     db = load_db()
     db[uid] = {"pat": FERNET.encrypt(pat.encode()).decode(), "acc": acc}
-    save_db(db)
+    try:
+        save_db(db)
+    except OSError as e:
+        ctx.user_data.clear()
+        await update.message.reply_text(
+            f"Could not save your login ({e}). The host storage is not writable. "
+            "Please contact the bot owner.")
+        return ConversationHandler.END
     ctx.user_data.clear()
     msg = "Logged in and saved."
     try:
@@ -905,7 +931,10 @@ async def confirm_logout(update, ctx):
             sessions[uid]["stop"] = True
         db = load_db()
         db.pop(uid, None)
-        save_db(db)
+        try:
+            save_db(db)
+        except OSError:
+            pass
         await update.message.reply_text("Logged out. Your token was deleted.",
                                         reply_markup=ReplyKeyboardRemove())
     else:
@@ -963,4 +992,4 @@ app.add_handler(conv)
 app.add_handler(CommandHandler("stop", stop))
 app.add_handler(CommandHandler("balance", balance_cmd))
 app.add_handler(CommandHandler("help", help_cmd))
-app.run_polling() 
+app.run_polling()
