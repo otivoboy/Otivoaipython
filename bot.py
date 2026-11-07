@@ -1,42 +1,37 @@
-import os, json, re, random, asyncio, itertools, logging, httpx, websockets
+import os, json, re, random, asyncio, itertools, httpx, websockets
 from contextlib import AsyncExitStack
-from cryptography.fernet import Fernet, InvalidToken
-from telegram import Update, BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                           ConversationHandler, ContextTypes, filters)
-
-logging.getLogger("httpx").setLevel(logging.WARNING)   # keep the bot token out of logs
 
 APP_ID = "34SRQBBtI5nwEFQqmc3se"   # hardcoded
 MAX_STAKE = 5000              # cap for the base stake
 MAX_MART_STAKE = 1000000      # hidden safety cap on martingale stakes
-
-# Bot token: works with TG_TOKEN or the names FadeHost provides
-TG_TOKEN = (os.environ.get("TG_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
-            or os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-            or os.environ.get("TOKEN"))
+TG_TOKEN = next((os.environ[k] for k in
+                 ("TG_TOKEN", "TELEGRAM_BOT_TOKEN", "BOT_TOKEN",
+                  "TELEGRAM_TOKEN", "TOKEN") if os.environ.get(k)), None)
 if not TG_TOKEN:
-    raise SystemExit("Missing bot token. Set TG_TOKEN in the host settings.")
-
+    raise SystemExit("No Telegram token found in the environment.")
 API = "https://api.derivws.com/trading/v1/options"
 
-# Data folder: the bot's own folder (writable on FadeHost), or DATA_DIR if set
-DATA_DIR = os.environ.get("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(DATA_DIR, ".deriv_bot_users.json")
-KEY_FILE = os.path.join(DATA_DIR, ".deriv_bot_key")
+
+def _pick_db():
+    """First writable location: DB_PATH env var, /data (host volume), home."""
+    for p in (os.environ.get("DB_PATH"),
+              "/data/deriv_bot_users.json",
+              os.path.expanduser("~/.deriv_bot_users.json")):
+        if p and os.access(os.path.dirname(p) or ".", os.W_OK):
+            return p
+    return os.path.abspath("deriv_bot_users.json")
+
+
+DB = _pick_db()
 
 # ---- Virtual mode account (hardcoded demo account) ----
 VIRTUAL_PAT = "pat_0cfa7f96d364eb299f47ea5e5fbdc2a5fff787ab85cdab4342e92e0b98fd0653"
 VIRTUAL_ACC = "DOT92647098"
 VIRTUAL_STAKE = 0.35          # fixed virtual stake (per leg for Dual)
 VIRTUAL_ACCU_STAKE = 1        # fixed virtual stake for accumulators
-
-# Optional: restrict the bot to certain Telegram user IDs (empty = public)
-ALLOWED = {x for x in os.environ.get("ALLOWED_IDS", "").split(",") if x}
-
-RISK = ("Trading is risky and most users lose money. Martingale can wipe a balance "
-        "quickly. Use a DEMO account first and a Trade-scope-only token. "
-        "No financial advice and no guarantees.")
 
 MARKETS = {
     "Vol 10": "R_10", "Vol 10 (1s)": "1HZ10V",
@@ -69,28 +64,8 @@ CF_CACHE = {}
 RID = itertools.count(1)
 
 
-# ---------- encryption for saved tokens ----------
-def load_key():
-    k = os.environ.get("DB_KEY")
-    if k:
-        return k.encode()
-    try:
-        if os.path.exists(KEY_FILE):
-            with open(KEY_FILE, "rb") as f:
-                return f.read().strip()
-    except OSError:
-        pass
-    k = Fernet.generate_key()
-    try:
-        with open(KEY_FILE, "wb") as f:
-            f.write(k)
-        os.chmod(KEY_FILE, 0o600)
-    except OSError:
-        logging.warning("Could not save key file. Set the DB_KEY variable.")
-    return k
-
-
-FERNET = Fernet(load_key())
+def norm(text):
+    return TYPE_LOOKUP.get(text.strip().lower())
 
 
 def load_db():
@@ -104,25 +79,7 @@ def load_db():
 def save_db(db):
     with open(DB, "w") as f:
         json.dump(db, f)
-    try:
-        os.chmod(DB, 0o600)
-    except OSError:
-        pass
-
-
-def get_creds(uid):
-    c = load_db().get(uid)
-    if not c:
-        return None
-    try:
-        pat = FERNET.decrypt(c["pat"].encode()).decode()
-    except InvalidToken:
-        pat = c["pat"]          # older login saved before encryption
-    return {"pat": pat, "acc": c["acc"]}
-
-
-def norm(text):
-    return TYPE_LOOKUP.get(text.strip().lower())
+    os.chmod(DB, 0o600)
 
 
 def hdr(pat):
@@ -138,32 +95,19 @@ def virtual_stake(t):
     return VIRTUAL_ACCU_STAKE if t == "Accumulator" else VIRTUAL_STAKE
 
 
-def allowed(update):
-    return (not ALLOWED) or str(update.effective_user.id) in ALLOWED
-
-
-# ---------- login / help ----------
+# ---------- login ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        await update.message.reply_text("Sorry, this bot is private.")
-        return ConversationHandler.END
     uid = str(update.effective_user.id)
     if uid in load_db():
         await update.message.reply_text(
             "Welcome back, you're logged in.\n"
             "/trade - start trading\n/balance - show account balance\n"
-            "/stop - stop current session\n/logout - log out\n/help - help")
+            "/stop - stop current session\n/logout - log out")
         return ConversationHandler.END
     await update.message.reply_text(
-        RISK + "\n\nSend your Deriv PAT (Trade scope, DEMO account recommended). "
+        "Send your Deriv PAT (Trade scope, DEMO account recommended). "
         "I'll delete your message right away.")
     return PAT
-
-
-async def help_cmd(update, ctx):
-    await update.message.reply_text(
-        "/start - log in\n/trade - start a trading session\n/balance - show balance\n"
-        "/stop - end the current session\n/logout - delete your saved token\n\n" + RISK)
 
 
 async def got_pat(update, ctx):
@@ -181,15 +125,8 @@ async def got_acc(update, ctx):
     pat = ctx.user_data["pat"]
     acc = update.message.text.strip()
     db = load_db()
-    db[uid] = {"pat": FERNET.encrypt(pat.encode()).decode(), "acc": acc}
-    try:
-        save_db(db)
-    except OSError as e:
-        ctx.user_data.clear()
-        await update.message.reply_text(
-            f"Could not save your login ({e}). The host storage is not writable. "
-            "Please contact the bot owner.")
-        return ConversationHandler.END
+    db[uid] = {"pat": pat, "acc": acc}
+    save_db(db)
     ctx.user_data.clear()
     msg = "Logged in and saved."
     try:
@@ -205,7 +142,7 @@ async def got_acc(update, ctx):
 
 async def balance_cmd(update, ctx):
     uid = str(update.effective_user.id)
-    creds = get_creds(uid)
+    creds = load_db().get(uid)
     if not creds:
         await update.message.reply_text("Please /start to log in first.")
         return
@@ -220,9 +157,6 @@ async def balance_cmd(update, ctx):
 
 # ---------- trade setup ----------
 async def trade(update, ctx):
-    if not allowed(update):
-        await update.message.reply_text("Sorry, this bot is private.")
-        return ConversationHandler.END
     uid = str(update.effective_user.id)
     if uid not in load_db():
         await update.message.reply_text("Please /start to log in first.")
@@ -567,11 +501,7 @@ async def got_sl(update, ctx):
     s = ctx.user_data["s"]
     s["sl"] = v
     uid = str(update.effective_user.id)
-    creds = get_creds(uid)
-    if not creds:
-        await update.message.reply_text("Please /start to log in first.")
-        ctx.user_data.clear()
-        return ConversationHandler.END
+    creds = load_db()[uid]
     state = {"stop": False}
     state["task"] = asyncio.create_task(
         run_session(ctx.bot, update.effective_chat.id, creds, dict(s), state))
@@ -931,10 +861,7 @@ async def confirm_logout(update, ctx):
             sessions[uid]["stop"] = True
         db = load_db()
         db.pop(uid, None)
-        try:
-            save_db(db)
-        except OSError:
-            pass
+        save_db(db)
         await update.message.reply_text("Logged out. Your token was deleted.",
                                         reply_markup=ReplyKeyboardRemove())
     else:
@@ -946,17 +873,6 @@ async def cancel(update, ctx):
     ctx.user_data.clear()
     await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
-
-
-async def setup_commands(application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Log in"),
-        BotCommand("trade", "Start a trading session"),
-        BotCommand("balance", "Show your balance"),
-        BotCommand("stop", "Stop the current session"),
-        BotCommand("logout", "Delete your saved token"),
-        BotCommand("help", "How the bot works"),
-    ])
 
 
 txt = filters.TEXT & ~filters.COMMAND
@@ -987,9 +903,8 @@ conv = ConversationHandler(
     },
     fallbacks=[CommandHandler("cancel", cancel)])
 
-app = ApplicationBuilder().token(TG_TOKEN).post_init(setup_commands).build()
+app = ApplicationBuilder().token(TG_TOKEN).build()
 app.add_handler(conv)
 app.add_handler(CommandHandler("stop", stop))
 app.add_handler(CommandHandler("balance", balance_cmd))
-app.add_handler(CommandHandler("help", help_cmd))
 app.run_polling()
