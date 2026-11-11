@@ -1,4 +1,4 @@
-import os, json, re, random, asyncio, itertools, logging, copy, httpx, websockets
+import os, json, re, random, time, asyncio, itertools, logging, copy, httpx, websockets
 from contextlib import AsyncExitStack
 from telegram import Update, BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
@@ -14,16 +14,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)   # keep the bot token out 
 APP_ID = "34SRQBBtI5nwEFQqmc3se"   # hardcoded
 MAX_STAKE = 5000              # cap for the base stake
 MAX_MART_STAKE = 1000000      # hidden safety cap on martingale stakes
-FAST_GAP = 0.25               # seconds between purchases in fast mode
-FAST_DEFAULT_OPEN = 3         # default max open contracts in fast mode
 TG_TOKEN = next((os.environ[k] for k in
                  ("TG_TOKEN", "TELEGRAM_BOT_TOKEN", "BOT_TOKEN",
                   "TELEGRAM_TOKEN", "TOKEN") if os.environ.get(k)), None)
 API = "https://api.derivws.com/trading/v1/options"
 
 RISK = ("Trading is risky and most users lose money. Martingale can wipe a balance "
-        "quickly, and Fast execution can stack losses even faster. Use a DEMO account "
-        "first and a Trade-scope-only token. No financial advice and no guarantees.")
+        "quickly, and Fast execution opens the next trade the moment the last one "
+        "closes, so losses can pile up quicker. Use a DEMO account first and a Trade-scope-only token. No financial advice and no guarantees.")
 
 
 def _pick_db():
@@ -85,10 +83,10 @@ NEW_STRAT = "New strategy"
 RESERVED_NAMES = {"skip", "new strategy", "back", "continue trading", "rename",
                   "delete", "cancel", "yes", "no"}
 
-(PAT, ACC, MARKET, EXEC, FASTOPEN, MODE, TTYPE, HTYPES, DIGIT, BARRIER, GROWTH,
+(PAT, ACC, MARKET, EXEC, MODE, TTYPE, HTYPES, DIGIT, BARRIER, GROWTH,
  ATP, STAKE, DUR, MART, MULT, VIRT, VLOSS, CONT, TP, SL, SAVE, OUT,
  STRAT_PICK, STRAT_ACT, RENAME, DELCONF,
- EDIT_STAKE, EDIT_TP, EDIT_SL) = range(30)
+ EDIT_STAKE, EDIT_TP, EDIT_SL) = range(29)
 sessions = {}
 CF_CACHE = {}
 RID = itertools.count(1)
@@ -219,7 +217,7 @@ def describe(s):
         ("Hybrid: " + " > ".join(parts)) if len(parts) > 1 else f"Type: {parts[0]}",
     ]
     if s.get("exec") == "fast":
-        lines.append(f"Execution: FAST (up to {s.get('fast_open', FAST_DEFAULT_OPEN)} open)")
+        lines.append("Execution: FAST (next trade opens right after the last closes)")
     else:
         lines.append("Execution: Normal")
     lines.append(f"Stake: {s['stake']}")
@@ -260,9 +258,9 @@ async def help_cmd(update, ctx):
         "/balance - show balance\n"
         "/stop - end the current session\n/logout - delete your saved token\n\n"
         "Execution modes:\n"
-        "- Normal: one contract at a time, waits for each result.\n"
-        "- Fast: keeps buying while earlier contracts are still open "
-        "(you choose how many can be open at once).\n\n" + RISK)
+        "- Normal: one contract at a time, with a short pause between trades.\n"
+        "- Fast: one contract at a time, but the next one is bought immediately "
+        "after the last one closes, with no pause.\n\n" + RISK)
 
 
 async def got_pat(update, ctx):
@@ -560,10 +558,10 @@ async def got_market(update, ctx):
                              one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
         "Execution speed?\n"
-        "- Normal: one contract at a time, waits for each result before the next.\n"
-        "- Fast: keeps buying contracts back to back while earlier ones are still "
-        "open. Much faster, but losses can stack up before martingale, type "
-        "switching, TP or SL react.", reply_markup=kb)
+        "- Normal: one contract at a time, with a short pause between trades.\n"
+        "- Fast: one contract at a time, but the next contract is bought immediately "
+        "after the last one closes (no pause, no extra balance checks), so trades "
+        "come as quickly as the market allows.", reply_markup=kb)
     return EXEC
 
 
@@ -584,23 +582,9 @@ async def got_exec(update, ctx):
         return await ask_mode(update)
     if a == "fast":
         s["exec"] = "fast"
-        kb = ReplyKeyboardMarkup([["2", "3", "5"], ["8", "10"]],
-                                 one_time_keyboard=True, resize_keyboard=True)
-        await update.message.reply_text(
-            "How many contracts can be open at the same time? (2-10)\n"
-            "Higher = faster, but more money at risk at once.", reply_markup=kb)
-        return FASTOPEN
+        return await ask_mode(update)
     await update.message.reply_text("Choose Normal or Fast.")
     return EXEC
-
-
-async def got_fastopen(update, ctx):
-    d = update.message.text.strip()
-    if not (d.isdigit() and int(d) in range(2, 11)):
-        await update.message.reply_text("Enter a whole number from 2 to 10.")
-        return FASTOPEN
-    ctx.user_data["s"]["fast_open"] = int(d)
-    return await ask_mode(update)
 
 
 async def got_mode(update, ctx):
@@ -1158,121 +1142,7 @@ async def trade_once(ws, s, t, param, stake, cur):
     return await execute(ws, s, t, param, stake, cur), ""
 
 
-# ---------- FAST execution (many contracts in flight) ----------
-class Conn:
-    """One websocket with a background reader, so many requests and open
-    contracts can be in flight at the same time (used by Fast execution)."""
-
-    def __init__(self, ws):
-        self.ws = ws
-        self.futs = {}        # req_id -> future (proposal, buy, balance, ping)
-        self.pocs = {}        # contract_id -> future (settled contract)
-        self.closed = None
-        self.task = asyncio.create_task(self._reader())
-
-    async def _reader(self):
-        err = None
-        try:
-            async for raw in self.ws:
-                try:
-                    d = json.loads(raw)
-                except ValueError:
-                    continue
-                rid = d.get("req_id")
-                fut = self.futs.get(rid) if rid is not None else None
-                if fut is not None:
-                    if not fut.done():
-                        fut.set_result(d)
-                    continue
-                poc = d.get("proposal_open_contract")
-                if poc:
-                    f = self.pocs.get(poc.get("contract_id"))
-                    if f and not f.done() and poc.get("is_sold"):
-                        f.set_result(poc)
-                    continue
-                if "error" in d:
-                    cid = (d.get("echo_req") or {}).get("contract_id")
-                    f = self.pocs.get(cid)
-                    if f and not f.done():
-                        f.set_exception(Exception(d["error"].get("message", "error")))
-        except Exception as e:
-            err = e
-        self.closed = err or ConnectionError("connection closed")
-        for f in list(self.futs.values()) + list(self.pocs.values()):
-            if not f.done():
-                f.set_exception(ConnectionError("connection lost"))
-
-    async def request(self, payload, timeout=30):
-        if self.closed:
-            raise ConnectionError("connection lost")
-        rid = next(RID)
-        fut = asyncio.get_running_loop().create_future()
-        self.futs[rid] = fut
-        try:
-            await self.ws.send(json.dumps({**payload, "req_id": rid}))
-            d = await asyncio.wait_for(fut, timeout)
-        finally:
-            self.futs.pop(rid, None)
-        if "error" in d:
-            raise Exception(d["error"]["message"])
-        return d
-
-    async def wait_settled(self, cid, timeout):
-        if self.closed:
-            raise ConnectionError("connection lost")
-        fut = asyncio.get_running_loop().create_future()
-        self.pocs[cid] = fut
-        try:
-            await self.ws.send(json.dumps({"proposal_open_contract": 1,
-                                           "contract_id": cid, "subscribe": 1}))
-            return await asyncio.wait_for(fut, timeout)
-        finally:
-            self.pocs.pop(cid, None)
-
-    def close(self):
-        self.task.cancel()
-
-
-async def conn_balance(conn):
-    d = await conn.request({"balance": 1}, timeout=15)
-    return float(d["balance"]["balance"])
-
-
-async def fast_execute(conn, s, t, param, stake, cur):
-    prop = await conn.request(build_proposal(s, t, param, stake, cur))
-    buy = await conn.request({"buy": prop["proposal"]["id"], "price": stake})
-    cid = buy["buy"]["contract_id"]
-    poc = await conn.wait_settled(cid, 7200 if t == "Accumulator" else 900)
-    return float(poc["profit"])
-
-
-async def fast_execute_dual(conn, s, t, stake, cur):
-    legs = dual_legs(s, t)
-    props = await asyncio.gather(*[
-        conn.request(dual_leg_proposal(s, ctype, barrier, stake, cur))
-        for ctype, barrier in legs])
-    buys = await asyncio.gather(*[
-        conn.request({"buy": p["proposal"]["id"], "price": stake})
-        for p in props], return_exceptions=True)
-    cids = [b["buy"]["contract_id"] for b in buys if not isinstance(b, Exception)]
-    errs = [str(b) for b in buys if isinstance(b, Exception)]
-    if not cids:
-        raise Exception(errs[0])
-    pocs = await asyncio.gather(*[conn.wait_settled(c, 900) for c in cids])
-    profits = [float(p["profit"]) for p in pocs]
-    if errs:
-        raise Exception(f"One leg failed to open ({errs[0]}). The other leg settled "
-                        f"with {sum(profits):+.2f}.")
-    return profits
-
-
-async def fast_trade_once(conn, s, t, param, stake, cur):
-    if t in DUAL:
-        ps = await fast_execute_dual(conn, s, t, stake, cur)
-        return sum(ps), " [legs " + " / ".join(f"{p:+.2f}" for p in ps) + "]"
-    return await fast_execute(conn, s, t, param, stake, cur), ""
-
-
+# ---------- FAST execution helper ----------
 class Reporter:
     """Batches lines and sends them every few seconds, so Fast mode doesn't
     hit Telegram's rate limit with one message per trade."""
@@ -1297,229 +1167,20 @@ class Reporter:
             await safe_send(self.bot, self.chat_id, chunk)
 
 
-async def run_fast(bot, chat_id, creds, s, state):
-    rep = Reporter(bot, chat_id)
-    base = s["stake"]
-    types = s["types"]
-    cap = int(s.get("fast_open", FAST_DEFAULT_OPEN))
-    st = {"total": 0.0, "n": 0, "wins": 0, "vn": 0, "stake": base, "step": 0,
-          "idx": 0, "vloss": 0, "phase": "virtual" if s["virtual"] else "real",
-          "open": 0, "vopen": 0, "exposure": 0.0, "errors": 0, "done": False,
-          "last_n": -1}
-    tasks = set()
-    cur = vcur = ""
-    last_bal = None
-    try:
-        async with AsyncExitStack() as stack:
-            ws = await stack.enter_async_context(
-                websockets.connect(await get_ws_url(creds["acc"], creds["pat"])))
-            last_bal, cur = await get_balance(ws)
-            for t in types:       # one-time Higher/Lower availability check
-                if t in BARRIER_TYPES:
-                    await check_barrier_contract(ws, s, t)
-                elif t == "Dual H/L":
-                    await check_barrier_contract(ws, s, "Higher")
-                    await check_barrier_contract(ws, s, "Lower")
-            conn = Conn(ws)
-            vconn = None
-            if s["virtual"]:
-                vws = await stack.enter_async_context(
-                    websockets.connect(await get_ws_url(VIRTUAL_ACC, VIRTUAL_PAT)))
-                _, vcur = await get_balance(vws)
-                vconn = Conn(vws)
+# ---------- trading loop (Normal and Fast) ----------
+# Both modes place ONE contract at a time. Normal pauses 1s between trades and
+# checks the balance after every trade. Fast buys the next contract the moment
+# the previous one closes, skips the balance check, and sends its Telegram
+# messages in batches so Telegram's rate limit never slows the trading.
+async def run_session(bot, chat_id, creds, s, state):
+    fast = s.get("exec") == "fast"
+    rep = Reporter(bot, chat_id) if fast else None
 
-            mode = "Hybrid: " + " > ".join(types) if len(types) > 1 else types[0]
-            mart = f", martingale x{s['mult']}" if s["mart"] else ""
-            virt = ""
-            if s["virtual"]:
-                virt = (f", VIRTUAL mode (real after {s['vneed']} virtual losses, "
-                        f"continuous real: {'on' if s['cont'] else 'off'})")
-            dur = f"{s['ticks']} ticks, " if s["ticks"] else ""
-            await safe_send(
-                bot, chat_id,
-                f"FAST session started: {s['market']}, {mode}, {dur}stake {base} {cur}"
-                f"{mart}{virt}, up to {cap} open at once, TP {s['tp']}, SL {s['sl']}.\n"
-                f"Balance: {last_bal:,.2f} {cur}\n"
-                "Results are counted as contracts settle, so TP/SL can overshoot a "
-                "little. Send /stop to end.")
-
-            def finish(msg):
-                if not st["done"]:
-                    st["done"] = True
-                    rep.add(msg)
-
-            def bump_error(msg):
-                st["errors"] += 1
-                rep.add(f"Error {msg}")
-                if st["errors"] >= 5:
-                    finish("Too many errors in a row. Session ended.")
-
-            async def real_trade(t, param, label, stake):
-                legs = 2 if t in DUAL else 1
-                per = " per leg" if t in DUAL else ""
-                st["open"] += 1
-                st["exposure"] += stake * legs
-                try:
-                    profit, det = await fast_trade_once(conn, s, t, param, stake, cur)
-                except Exception as e:
-                    bump_error(f"({label}): {e}")
-                    return
-                finally:
-                    st["open"] -= 1
-                    st["exposure"] -= stake * legs
-                st["errors"] = 0
-                st["total"] += profit
-                st["n"] += 1
-                won = profit > 0
-                st["wins"] += won
-                rep.add(f"#{st['n']} REAL {label} (stake {stake}{per}): "
-                        f"{'WIN' if won else 'LOSS'} {profit:+.2f}{det} | "
-                        f"Total {st['total']:+.2f} {cur}")
-                if st["done"]:
-                    return
-                if st["total"] >= s["tp"]:
-                    finish("Take profit reached. Session ended.")
-                    return
-                if st["total"] <= -s["sl"]:
-                    finish("Stop loss reached. Session ended.")
-                    return
-                if not won and len(types) > 1:
-                    st["idx"] = (st["idx"] + 1) % len(types)
-                    rep.add(f"Real loss, switching to {types[st['idx']]}")
-                if s["mart"]:
-                    if won:
-                        st["step"], st["stake"] = 0, base
-                    else:
-                        st["step"] += 1
-                        new = round(base * (s["mult"] ** st["step"]), 2)
-                        if new > MAX_MART_STAKE:
-                            st["step"], st["stake"] = 0, base
-                            rep.add("Safety cap reached, stake reset to base.")
-                        else:
-                            st["stake"] = new
-                if s["virtual"]:
-                    if won:
-                        st["vloss"], st["phase"] = 0, "virtual"
-                        rep.add("Real win, back to virtual mode.")
-                    elif s["cont"]:
-                        rep.add("Real loss, continuing real trades until a win.")
-                    else:
-                        st["vloss"], st["phase"] = 0, "virtual"
-                        rep.add("Back to virtual mode.")
-
-            async def virt_trade(t, param, label):
-                vs = virtual_stake(t)
-                per = " per leg" if t in DUAL else ""
-                st["vopen"] += 1
-                try:
-                    profit, det = await fast_trade_once(vconn, s, t, param, vs, vcur)
-                except Exception as e:
-                    bump_error(f"(virtual {label}): {e}")
-                    return
-                finally:
-                    st["vopen"] -= 1
-                st["errors"] = 0
-                st["vn"] += 1
-                vwon = profit > 0
-                if st["phase"] != "virtual":
-                    return            # late result from before the switch to real
-                st["vloss"] = 0 if vwon else st["vloss"] + 1
-                rep.add(f"V#{st['vn']} {label} (virtual {vs}{per}): "
-                        f"{'WIN' if vwon else 'LOSS'}{det} | "
-                        f"virtual losses {st['vloss']}/{s['vneed']}")
-                if st["vloss"] >= s["vneed"]:
-                    st["phase"] = "real"
-                    rep.add(f"Virtual loss target reached. Next trade is REAL "
-                            f"({types[st['idx']]}).")
-
-            def spawn(coro):
-                tk = asyncio.create_task(coro)
-                tasks.add(tk)
-                tk.add_done_callback(tasks.discard)
-
-            async def housekeeping():
-                tick = 0
-                while True:
-                    await asyncio.sleep(3)
-                    tick += 1
-                    if tick % 10 == 0:                    # keep idle links alive
-                        for c in (conn, vconn):
-                            if c:
-                                try:
-                                    await c.request({"ping": 1}, timeout=10)
-                                except Exception:
-                                    pass
-                    if tick % 5 == 0 and st["n"] + st["vn"] != st["last_n"]:
-                        st["last_n"] = st["n"] + st["vn"]
-                        v = f" | Virtual {st['vn']}" if s["virtual"] else ""
-                        rep.add(f"STATS Runs {st['n']} | Won {st['wins']} | "
-                                f"Lost {st['n'] - st['wins']} | "
-                                f"P/L {st['total']:+.2f} {cur} | Stake {st['stake']} | "
-                                f"Open {st['open']}{v}")
-                    await rep.flush()
-
-            hk = asyncio.create_task(housekeeping())
-            try:
-                while not state["stop"] and not st["done"]:
-                    if conn.closed or (vconn and vconn.closed):
-                        finish("Connection lost. Session ended.")
-                        break
-                    t = types[st["idx"]]
-                    if s["virtual"] and st["phase"] == "virtual":
-                        if st["vopen"] >= cap:
-                            await asyncio.sleep(0.05)
-                            continue
-                        param = pick_param(s, t)
-                        spawn(virt_trade(t, param, make_label(s, t, param)))
-                        await asyncio.sleep(FAST_GAP)
-                        continue
-                    # real trade
-                    if s["virtual"]:
-                        if st["open"] > 0:        # one real trade at a time here
-                            await asyncio.sleep(0.05)
-                            continue
-                    elif st["open"] >= cap:
-                        await asyncio.sleep(0.05)
-                        continue
-                    stake = st["stake"]
-                    legs = 2 if t in DUAL else 1
-                    # don't open more risk than the stop loss can absorb
-                    if st["open"] > 0 and (st["total"] - st["exposure"]
-                                           - stake * legs) <= -s["sl"]:
-                        await asyncio.sleep(0.05)
-                        continue
-                    param = pick_param(s, t)
-                    spawn(real_trade(t, param, make_label(s, t, param), stake))
-                    await asyncio.sleep(FAST_GAP)
-                if tasks:
-                    await asyncio.gather(*list(tasks), return_exceptions=True)
-                try:
-                    last_bal = await conn_balance(conn)
-                except Exception:
-                    pass
-            finally:
-                hk.cancel()
-                for tk in list(tasks):
-                    tk.cancel()
-                conn.close()
-                if vconn:
-                    vconn.close()
-    except Exception as e:
-        logging.warning("Session error: %s", e)
-        rep.add(f"Error: {e}")
-    await rep.flush()
-    extra = f", {st['vn']} virtual trades" if s["virtual"] else ""
-    bal_txt = f"\nBalance: {last_bal:,.2f} {cur}" if last_bal is not None else ""
-    await safe_send(
-        bot, chat_id,
-        f"Summary (FAST): {st['n']} real trades, {st['wins']} wins, "
-        f"total {st['total']:+.2f} {cur}{extra}.{bal_txt}\n/trade to start again.")
-
-
-# ---------- trading loop (NORMAL execution) ----------
-async def run_normal(bot, chat_id, creds, s, state):
     async def say(t):
-        await safe_send(bot, chat_id, t)
+        if fast:
+            rep.add(t)
+        else:
+            await safe_send(bot, chat_id, t)
 
     total, n, wins, vn = 0.0, 0, 0, 0
     cur = ""
@@ -1530,6 +1191,22 @@ async def run_normal(bot, chat_id, creds, s, state):
     types = s["types"]
     idx = 0          # current contract type; only changes after a REAL loss
     vloss = 0        # consecutive virtual losses
+    last_ping = 0.0
+    last_n = [-1]
+    flusher = None
+
+    async def flush_loop():
+        tick = 0
+        while True:
+            await asyncio.sleep(3)
+            tick += 1
+            if tick % 5 == 0 and n + vn != last_n[0]:
+                last_n[0] = n + vn
+                v = f" | Virtual {vn}" if s["virtual"] else ""
+                rep.add(f"STATS Runs {n} | Won {wins} | Lost {n - wins} | "
+                        f"P/L {total:+.2f} {cur} | Stake {stake}{v}")
+            await rep.flush()
+
     try:
         async with AsyncExitStack() as stack:
             ws = await stack.enter_async_context(
@@ -1548,10 +1225,15 @@ async def run_normal(bot, chat_id, creds, s, state):
                 virt = (f", VIRTUAL mode (real after {s['vneed']} virtual losses, "
                         f"continuous real: {'on' if s['cont'] else 'off'})")
             dur = f"{s['ticks']} ticks, " if s["ticks"] else ""
-            await say(f"Session started: {s['market']}, {mode}, "
-                      f"{dur}stake {base} {cur}{mart}{virt}, "
-                      f"TP {s['tp']}, SL {s['sl']}.\n"
-                      f"Balance: {last_bal:,.2f} {cur}\nSend /stop to end.")
+            await safe_send(
+                bot, chat_id,
+                f"{'FAST session' if fast else 'Session'} started: {s['market']}, {mode}, "
+                f"{dur}stake {base} {cur}{mart}{virt}, TP {s['tp']}, SL {s['sl']}.\n"
+                f"Balance: {last_bal:,.2f} {cur}\n"
+                + ("Each trade opens right after the previous one closes. " if fast else "")
+                + "Send /stop to end.")
+            if fast:
+                flusher = asyncio.create_task(flush_loop())
 
             while not state["stop"]:
                 t = types[idx]
@@ -1561,8 +1243,11 @@ async def run_normal(bot, chat_id, creds, s, state):
 
                 # ----- virtual trade (type never switches here) -----
                 if s["virtual"] and vloss < s["vneed"]:
-                    await ws.send(json.dumps({"ping": 1}))   # keep real link alive
-                    await recv_until(ws, "ping")
+                    # keep the real link alive (every trade in Normal, every 30s in Fast)
+                    if not fast or time.monotonic() - last_ping > 30:
+                        await ws.send(json.dumps({"ping": 1}))
+                        await recv_until(ws, "ping")
+                        last_ping = time.monotonic()
                     vs = virtual_stake(t)
                     vprofit, vdet = await trade_once(vws, s, t, param, vs, vcur)
                     vn += 1
@@ -1573,20 +1258,23 @@ async def run_normal(bot, chat_id, creds, s, state):
                               f"virtual losses {vloss}/{s['vneed']}")
                     if vloss >= s["vneed"]:
                         await say(f"Virtual loss target reached. Next trade is REAL ({t}).")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0 if fast else 1)
                     continue
 
                 # ----- real trade (same type as the virtual phase) -----
                 profit, det = await trade_once(ws, s, t, param, stake, cur)
+                last_ping = time.monotonic()
                 total += profit
                 n += 1
                 won = profit > 0
                 wins += won
-                try:
-                    last_bal, _ = await get_balance(ws)
-                    btxt = f" | Balance {last_bal:,.2f} {cur}"
-                except Exception:
-                    btxt = ""
+                btxt = ""
+                if not fast:
+                    try:
+                        last_bal, _ = await get_balance(ws)
+                        btxt = f" | Balance {last_bal:,.2f} {cur}"
+                    except Exception:
+                        pass
                 await say(f"#{n} REAL {label} (stake {stake}{per}): "
                           f"{'WIN' if won else 'LOSS'} "
                           f"{profit:+.2f}{det} | Total {total:+.2f} {cur}{btxt}")
@@ -1625,21 +1313,26 @@ async def run_normal(bot, chat_id, creds, s, state):
                     else:
                         vloss = 0
                         await say("Back to virtual mode.")
-                await asyncio.sleep(1)
+                await asyncio.sleep(0 if fast else 1)
+
+            if fast:                      # one balance check at the end
+                try:
+                    last_bal, _ = await get_balance(ws)
+                except Exception:
+                    pass
     except Exception as e:
         logging.warning("Session error: %s", e)
         await say(f"Error: {e}")
+    finally:
+        if flusher:
+            flusher.cancel()
+    if rep:
+        await rep.flush()
     extra = f", {vn} virtual trades" if s["virtual"] else ""
     bal_txt = f"\nBalance: {last_bal:,.2f} {cur}" if last_bal is not None else ""
-    await say(f"Summary: {n} real trades, {wins} wins, total {total:+.2f} {cur}{extra}."
-              f"{bal_txt}\n/trade to start again.")
-
-
-async def run_session(bot, chat_id, creds, s, state):
-    if s.get("exec") == "fast":
-        await run_fast(bot, chat_id, creds, s, state)
-    else:
-        await run_normal(bot, chat_id, creds, s, state)
+    await safe_send(bot, chat_id,
+                    f"Summary{' (FAST)' if fast else ''}: {n} real trades, {wins} wins, "
+                    f"total {total:+.2f} {cur}{extra}.{bal_txt}\n/trade to start again.")
 
 
 async def stop(update, ctx):
@@ -1647,7 +1340,7 @@ async def stop(update, ctx):
     if running(uid):
         sessions[uid]["stop"] = True
         await update.message.reply_text(
-            "Stopping after the open trade(s) finish...")
+            "Stopping after the current trade finishes...")
     else:
         await update.message.reply_text("No session is running.")
 
@@ -1727,7 +1420,6 @@ def build_app():
             EDIT_SL: [MessageHandler(txt, got_edit_sl)],
             MARKET: [MessageHandler(txt, got_market)],
             EXEC: [MessageHandler(txt, got_exec)],
-            FASTOPEN: [MessageHandler(txt, got_fastopen)],
             MODE: [MessageHandler(txt, got_mode)],
             TTYPE: [MessageHandler(txt, got_type)],
             HTYPES: [MessageHandler(txt, got_htypes)],
@@ -1765,3 +1457,4 @@ if __name__ == "__main__":
     if not TG_TOKEN:
         raise SystemExit("No Telegram token found in the environment.")
     build_app().run_polling(bootstrap_retries=-1)
+ 
