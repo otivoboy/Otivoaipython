@@ -1,5 +1,6 @@
 import os, json, re, random, time, asyncio, itertools, logging, copy, httpx, websockets
 from contextlib import AsyncExitStack
+from websockets.exceptions import ConnectionClosed
 from telegram import Update, BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                           ConversationHandler, ContextTypes, filters)
@@ -14,6 +15,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)   # keep the bot token out 
 APP_ID = "34SRQBBtI5nwEFQqmc3se"   # hardcoded
 MAX_STAKE = 5000              # cap for the base stake
 MAX_MART_STAKE = 1000000      # hidden safety cap on martingale stakes
+RECONNECT_TRIES = 12          # connection attempts per drop (waits grow 1s..30s)
+MAX_DROPS = 10                # give up if a link drops this many times in 5 minutes
 TG_TOKEN = next((os.environ[k] for k in
                  ("TG_TOKEN", "TELEGRAM_BOT_TOKEN", "BOT_TOKEN",
                   "TELEGRAM_TOKEN", "TOKEN") if os.environ.get(k)), None)
@@ -1047,64 +1050,211 @@ def dual_leg_proposal(s, ctype, barrier, stake, cur):
         "underlying_symbol": s["market"], "barrier": barrier}
 
 
-# ---------- NORMAL execution (one contract at a time) ----------
-async def execute(ws, s, t, param, stake, cur):
-    """Place one contract on the given connection and return its profit."""
+# ---------- connection handling (auto-reconnect) ----------
+class StopSession(Exception):
+    """The user sent /stop while the bot was reconnecting."""
+
+
+class BuyUnknown(Exception):
+    """The link dropped while a buy was in flight, so the bot can't tell
+    whether that contract was opened."""
+
+
+CONN_ERRORS = (ConnectionClosed, ConnectionError, OSError,
+               asyncio.TimeoutError, EOFError, httpx.TransportError)
+
+
+def is_conn_error(e):
+    return isinstance(e, CONN_ERRORS)
+
+
+class Link:
+    """A websocket that can be reopened. It has the same send()/recv() as a
+    websocket, so every trade helper works with it unchanged. When the link
+    drops, recover() gets a fresh login URL and reconnects."""
+
+    def __init__(self, acc, pat, label, say, state):
+        self.acc, self.pat, self.label = acc, pat, label
+        self.say, self.state = say, state
+        self.ws = None
+        self.drops = []
+
+    async def open(self):
+        url = await get_ws_url(self.acc, self.pat)
+        self.ws = await websockets.connect(url)
+
+    async def close(self):
+        ws, self.ws = self.ws, None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    async def send(self, data):
+        return await self.ws.send(data)
+
+    async def recv(self):
+        return await self.ws.recv()
+
+    async def recover(self, err):
+        """Reconnect with growing waits. Raises if it cannot."""
+        now = time.monotonic()
+        self.drops = [t for t in self.drops if now - t < 300] + [now]
+        if len(self.drops) > MAX_DROPS:
+            raise ConnectionError(
+                f"{self.label} dropped {len(self.drops)} times in 5 minutes, giving up.")
+        await self.say(f"{self.label} connection lost ({err or type(err).__name__}). "
+                       "Reconnecting...")
+        delay = 1
+        for attempt in range(RECONNECT_TRIES):
+            if self.state.get("stop"):
+                raise StopSession()
+            try:
+                await self.close()
+                await self.open()
+                await self.say(f"{self.label} reconnected.")
+                return
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (400, 401, 403, 404):
+                    raise Exception(
+                        f"{self.label} login was rejected while reconnecting "
+                        f"({e.response.status_code}). Check your token: /logout "
+                        "then /start.")
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
+        raise ConnectionError(f"Could not reconnect {self.label} after "
+                              f"{RECONNECT_TRIES} tries.")
+
+
+async def retry_safe(link, fn):
+    """Run fn(); if the connection drops, reconnect and run it again. Only for
+    steps that are safe to repeat (nothing has been bought yet)."""
+    while True:
+        try:
+            return await fn()
+        except Exception as e:
+            if not is_conn_error(e):
+                raise
+            await link.recover(e)
+
+
+async def _proposal(link, req):
+    await link.send(json.dumps(req))
+    return await recv_until(link, "proposal")
+
+
+async def wait_settled(link, cids):
+    """Follow open contracts until every one is settled. If the link drops,
+    reconnect and subscribe again (a contract that already closed is reported
+    as closed right away). Returns {contract_id: profit}."""
+    profits = {}
+    subscribed = False
+    while len(profits) < len(cids):
+        try:
+            if not subscribed:
+                for cid in cids:
+                    if cid not in profits:
+                        await link.send(json.dumps({"proposal_open_contract": 1,
+                                                    "contract_id": cid, "subscribe": 1}))
+                subscribed = True
+            m = json.loads(await asyncio.wait_for(link.recv(), 60))
+            if "error" in m:
+                raise Exception(m["error"]["message"])
+            poc = m.get("proposal_open_contract")
+            if poc and poc.get("contract_id") in cids and poc.get("is_sold"):
+                profits[poc["contract_id"]] = float(poc["profit"])
+        except Exception as e:
+            if not is_conn_error(e):
+                raise
+            await link.recover(e)
+            subscribed = False
+    return profits
+
+
+# ---------- trade execution (one contract at a time) ----------
+async def execute(link, s, t, param, stake, cur):
+    """Place one contract and return its profit. Survives dropped connections."""
     req = build_proposal(s, t, param, stake, cur)
-    if t in BARRIER_TYPES:
-        await check_barrier_contract(ws, s, t)
-    await ws.send(json.dumps(req))
-    prop = await recv_until(ws, "proposal")
-    if "error" in prop:
-        msg = prop["error"]["message"]
+    while True:
         if t in BARRIER_TYPES:
-            msg += f" (sent {TYPES[t]} {s['market']} barrier {param}, {s['ticks']} ticks)"
-        raise Exception(msg)
-    await ws.send(json.dumps({"buy": prop["proposal"]["id"], "price": stake}))
-    buy = await recv_until(ws, "buy")
+            await retry_safe(link, lambda: check_barrier_contract(link, s, t))
+        prop = await retry_safe(link, lambda: _proposal(link, req))
+        if "error" in prop:
+            msg = prop["error"]["message"]
+            if t in BARRIER_TYPES:
+                msg += f" (sent {TYPES[t]} {s['market']} barrier {param}, {s['ticks']} ticks)"
+            raise Exception(msg)
+        try:
+            await link.send(json.dumps({"buy": prop["proposal"]["id"], "price": stake}))
+        except Exception as e:
+            if not is_conn_error(e):
+                raise
+            await link.recover(e)
+            continue                  # the buy never left, start over safely
+        try:
+            buy = await recv_until(link, "buy")
+        except Exception as e:
+            if not is_conn_error(e):
+                raise
+            await link.recover(e)
+            raise BuyUnknown(f"{t}: the connection dropped while buying, so it is "
+                             "unknown whether this contract opened.")
+        break
     if "error" in buy:
         raise Exception(buy["error"]["message"])
     cid = buy["buy"]["contract_id"]
-    await ws.send(json.dumps({"proposal_open_contract": 1,
-                              "contract_id": cid, "subscribe": 1}))
-    while True:
-        m = await recv_until(ws, "proposal_open_contract")
-        if "error" in m:
-            raise Exception(m["error"]["message"])
-        poc = m["proposal_open_contract"]
-        if poc.get("contract_id") == cid and poc.get("is_sold"):
-            return float(poc["profit"])
+    profits = await wait_settled(link, [cid])
+    return profits[cid]
 
 
-async def execute_dual(ws, s, t, stake, cur):
+async def execute_dual(link, s, t, stake, cur):
     """Open both legs together (same tick duration, so they expire on the same
     tick) and return a list with each leg's profit."""
     legs = dual_legs(s, t)
-    if t == "Dual H/L":
-        await check_barrier_contract(ws, s, "Higher")
-        await check_barrier_contract(ws, s, "Lower")
+    while True:
+        if t == "Dual H/L":
+            await retry_safe(link, lambda: check_barrier_contract(link, s, "Higher"))
+            await retry_safe(link, lambda: check_barrier_contract(link, s, "Lower"))
 
-    # 1) request both proposals at once
-    prids = []
-    for ctype, barrier in legs:
-        rid = next(RID)
-        prids.append(rid)
-        req = dual_leg_proposal(s, ctype, barrier, stake, cur)
-        req["req_id"] = rid
-        await ws.send(json.dumps(req))
-    props = await collect(ws, prids)
-    for rid, (ctype, barrier) in zip(prids, legs):
-        if "error" in props[rid]:
-            raise Exception(f"{ctype} {barrier}: {props[rid]['error']['message']}")
+        # 1) request both proposals at once
+        async def get_props():
+            prids = []
+            for ctype, barrier in legs:
+                rid = next(RID)
+                prids.append(rid)
+                req = dual_leg_proposal(s, ctype, barrier, stake, cur)
+                req["req_id"] = rid
+                await link.send(json.dumps(req))
+            return prids, await collect(link, prids)
 
-    # 2) buy both back to back, no waiting in between
-    brids = []
-    for rid in prids:
-        brid = next(RID)
-        brids.append(brid)
-        await ws.send(json.dumps({"buy": props[rid]["proposal"]["id"],
-                                  "price": stake, "req_id": brid}))
-    buys = await collect(ws, brids)
+        prids, props = await retry_safe(link, get_props)
+        for rid, (ctype, barrier) in zip(prids, legs):
+            if "error" in props[rid]:
+                raise Exception(f"{ctype} {barrier}: {props[rid]['error']['message']}")
+
+        # 2) buy both back to back, no waiting in between
+        brids, sent = [], 0
+        try:
+            for rid in prids:
+                brid = next(RID)
+                brids.append(brid)
+                await link.send(json.dumps({"buy": props[rid]["proposal"]["id"],
+                                            "price": stake, "req_id": brid}))
+                sent += 1
+            buys = await collect(link, brids)
+        except Exception as e:
+            if not is_conn_error(e):
+                raise
+            await link.recover(e)
+            if sent == 0:
+                continue              # nothing was sent, start over safely
+            raise BuyUnknown(f"{t}: the connection dropped while buying, so it is "
+                             "unknown whether these contracts opened.")
+        break
+
     cids, errs = [], []
     for brid in brids:
         b = buys[brid]
@@ -1116,17 +1266,7 @@ async def execute_dual(ws, s, t, stake, cur):
         raise Exception(errs[0])
 
     # 3) follow both contracts until both are settled
-    for cid in cids:
-        await ws.send(json.dumps({"proposal_open_contract": 1,
-                                  "contract_id": cid, "subscribe": 1}))
-    profits = {}
-    while len(profits) < len(cids):
-        m = json.loads(await asyncio.wait_for(ws.recv(), 60))
-        if "error" in m:
-            raise Exception(m["error"]["message"])
-        poc = m.get("proposal_open_contract")
-        if poc and poc.get("contract_id") in cids and poc.get("is_sold"):
-            profits[poc["contract_id"]] = float(poc["profit"])
+    profits = await wait_settled(link, cids)
     if errs:
         raise Exception(
             f"One leg failed to open ({errs[0]}). The other leg settled "
@@ -1134,12 +1274,12 @@ async def execute_dual(ws, s, t, stake, cur):
     return [profits[c] for c in cids]
 
 
-async def trade_once(ws, s, t, param, stake, cur):
+async def trade_once(link, s, t, param, stake, cur):
     """Returns (net profit, detail text)."""
     if t in DUAL:
-        ps = await execute_dual(ws, s, t, stake, cur)
+        ps = await execute_dual(link, s, t, stake, cur)
         return sum(ps), " [legs " + " / ".join(f"{p:+.2f}" for p in ps) + "]"
-    return await execute(ws, s, t, param, stake, cur), ""
+    return await execute(link, s, t, param, stake, cur), ""
 
 
 # ---------- FAST execution helper ----------
@@ -1209,14 +1349,20 @@ async def run_session(bot, chat_id, creds, s, state):
 
     try:
         async with AsyncExitStack() as stack:
-            ws = await stack.enter_async_context(
-                websockets.connect(await get_ws_url(creds["acc"], creds["pat"])))
-            last_bal, cur = await get_balance(ws)
-            vws, vcur = None, ""
+            link = Link(creds["acc"], creds["pat"], "Real account", say, state)
+            await link.open()
+            stack.push_async_callback(link.close)
+            last_bal, cur = await get_balance(link)
+            vlink, vcur = None, ""
             if s["virtual"]:
-                vws = await stack.enter_async_context(
-                    websockets.connect(await get_ws_url(VIRTUAL_ACC, VIRTUAL_PAT)))
-                _, vcur = await get_balance(vws)
+                vlink = Link(VIRTUAL_ACC, VIRTUAL_PAT, "Virtual account", say, state)
+                await vlink.open()
+                stack.push_async_callback(vlink.close)
+                _, vcur = await get_balance(vlink)
+
+            async def ping_real():
+                await link.send(json.dumps({"ping": 1}))
+                await recv_until(link, "ping")
 
             mode = "Hybrid: " + " > ".join(types) if len(types) > 1 else types[0]
             mart = f", martingale x{s['mult']}" if s["mart"] else ""
@@ -1245,11 +1391,14 @@ async def run_session(bot, chat_id, creds, s, state):
                 if s["virtual"] and vloss < s["vneed"]:
                     # keep the real link alive (every trade in Normal, every 30s in Fast)
                     if not fast or time.monotonic() - last_ping > 30:
-                        await ws.send(json.dumps({"ping": 1}))
-                        await recv_until(ws, "ping")
+                        await retry_safe(link, ping_real)
                         last_ping = time.monotonic()
                     vs = virtual_stake(t)
-                    vprofit, vdet = await trade_once(vws, s, t, param, vs, vcur)
+                    try:
+                        vprofit, vdet = await trade_once(vlink, s, t, param, vs, vcur)
+                    except BuyUnknown as e:
+                        await say(f"Virtual trade skipped: {e}")
+                        continue
                     vn += 1
                     vwon = vprofit > 0
                     vloss = 0 if vwon else vloss + 1
@@ -1262,7 +1411,12 @@ async def run_session(bot, chat_id, creds, s, state):
                     continue
 
                 # ----- real trade (same type as the virtual phase) -----
-                profit, det = await trade_once(ws, s, t, param, stake, cur)
+                try:
+                    profit, det = await trade_once(link, s, t, param, stake, cur)
+                except BuyUnknown as e:
+                    await say(f"REAL trade result unknown: {e} Check your Deriv "
+                              "statement. Continuing with the next trade.")
+                    continue
                 last_ping = time.monotonic()
                 total += profit
                 n += 1
@@ -1271,7 +1425,7 @@ async def run_session(bot, chat_id, creds, s, state):
                 btxt = ""
                 if not fast:
                     try:
-                        last_bal, _ = await get_balance(ws)
+                        last_bal, _ = await get_balance(link)
                         btxt = f" | Balance {last_bal:,.2f} {cur}"
                     except Exception:
                         pass
@@ -1317,9 +1471,11 @@ async def run_session(bot, chat_id, creds, s, state):
 
             if fast:                      # one balance check at the end
                 try:
-                    last_bal, _ = await get_balance(ws)
+                    last_bal, _ = await get_balance(link)
                 except Exception:
                     pass
+    except StopSession:
+        pass
     except Exception as e:
         logging.warning("Session error: %s", e)
         await say(f"Error: {e}")
@@ -1457,4 +1613,3 @@ if __name__ == "__main__":
     if not TG_TOKEN:
         raise SystemExit("No Telegram token found in the environment.")
     build_app().run_polling(bootstrap_retries=-1)
- 
