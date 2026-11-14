@@ -89,7 +89,7 @@ RESERVED_NAMES = {"skip", "new strategy", "back", "continue trading", "rename",
 (PAT, ACC, MARKET, EXEC, MODE, TTYPE, HTYPES, DIGIT, BARRIER, GROWTH,
  ATP, STAKE, DUR, MART, MULT, VIRT, VLOSS, CONT, TP, SL, SAVE, OUT,
  STRAT_PICK, STRAT_ACT, RENAME, DELCONF,
- EDIT_STAKE, EDIT_TP, EDIT_SL) = range(29)
+ EDIT_STAKE, EDIT_TP, EDIT_SL, MTICK, MTSTEP, MTTICKS) = range(32)
 sessions = {}
 CF_CACHE = {}
 RID = itertools.count(1)
@@ -225,7 +225,10 @@ def describe(s):
         lines.append("Execution: Normal")
     lines.append(f"Stake: {s['stake']}")
     if s.get("ticks"):
-        lines.append(f"Duration: {s['ticks']} ticks")
+        d = f"Duration: {s['ticks']} ticks"
+        if s.get("mart") and s.get("mart_tick_step") and s.get("mart_ticks"):
+            d += f" ({s['mart_ticks']} ticks from martingale step {s['mart_tick_step']})"
+        lines.append(d)
     lines.append(f"Martingale: x{s['mult']}" if s.get("mart") else "Martingale: off")
     if s.get("virtual"):
         lines.append(f"Virtual: real after {s['vneed']} virtual losses, "
@@ -835,6 +838,64 @@ async def got_mult(update, ctx):
         await update.message.reply_text("Enter a number between 1.1 and 100.")
         return MULT
     ctx.user_data["s"]["mult"] = v
+    return await ask_mtick(update, ctx)
+
+
+async def ask_mtick(update, ctx):
+    s = ctx.user_data["s"]
+    if not needs_duration(s):          # accumulator only: no duration to change
+        s["mart_tick_step"] = 0
+        return await ask_virtual(update)
+    kb = ReplyKeyboardMarkup([["Yes", "No"]], one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(
+        f"Change the duration at a martingale step?\n"
+        f"Example: trade {s['ticks']} ticks normally, but from martingale step 3 "
+        "(the 3rd stake raise in a row) switch to a different number of ticks. "
+        "It goes back to the normal duration after a win.", reply_markup=kb)
+    return MTICK
+
+
+async def got_mtick(update, ctx):
+    a = update.message.text.strip().lower()
+    s = ctx.user_data["s"]
+    if a == "yes":
+        await update.message.reply_text(
+            "From which martingale step? (1-50)\n"
+            "Step 1 = the first raised stake after a loss, step 2 = the second, and so on.",
+            reply_markup=ReplyKeyboardRemove())
+        return MTSTEP
+    if a == "no":
+        s["mart_tick_step"] = 0
+        return await ask_virtual(update)
+    await update.message.reply_text("Answer Yes or No.")
+    return MTICK
+
+
+async def got_mtstep(update, ctx):
+    d = update.message.text.strip()
+    if not (d.isdigit() and int(d) in range(1, 51)):
+        await update.message.reply_text("Enter a whole number from 1 to 50.")
+        return MTSTEP
+    s = ctx.user_data["s"]
+    s["mart_tick_step"] = int(d)
+    await update.message.reply_text(
+        f"Duration in ticks from step {d}? ({min_ticks(s)}-10, normal duration is "
+        f"{s['ticks']})")
+    return MTTICKS
+
+
+async def got_mtticks(update, ctx):
+    s = ctx.user_data["s"]
+    lo = min_ticks(s)
+    d = update.message.text.strip()
+    if not (d.isdigit() and int(d) in range(lo, 11)):
+        await update.message.reply_text(f"Enter a whole number from {lo} to 10.")
+        return MTTICKS
+    if int(d) == s["ticks"]:
+        await update.message.reply_text(
+            "That's the same as the normal duration. Pick a different number.")
+        return MTTICKS
+    s["mart_ticks"] = int(d)
     return await ask_virtual(update)
 
 
@@ -1334,6 +1395,17 @@ async def run_session(bot, chat_id, creds, s, state):
     last_ping = 0.0
     last_n = [-1]
     flusher = None
+    mts = s.get("mart_tick_step") or 0     # martingale step where duration changes
+    mtt = s.get("mart_ticks")              # duration (ticks) from that step on
+
+    def eff_ticks():
+        """Duration for the next trade: the martingale-step duration once the
+        step is reached, otherwise the normal duration."""
+        if s["mart"] and mts and mtt and step >= mts:
+            return mtt
+        return s["ticks"]
+
+    cur_ticks = s["ticks"]
 
     async def flush_loop():
         tick = 0
@@ -1360,6 +1432,14 @@ async def run_session(bot, chat_id, creds, s, state):
                 stack.push_async_callback(vlink.close)
                 _, vcur = await get_balance(vlink)
 
+            if mts and mtt:       # make sure the step duration is allowed up front
+                for tk in (s["ticks"], mtt):
+                    for t in types:
+                        for bt in (["Higher", "Lower"] if t == "Dual H/L"
+                                   else [t] if t in BARRIER_TYPES else []):
+                            await retry_safe(link, lambda: check_barrier_contract(
+                                link, {**s, "ticks": tk}, bt))
+
             async def ping_real():
                 await link.send(json.dumps({"ping": 1}))
                 await recv_until(link, "ping")
@@ -1371,6 +1451,9 @@ async def run_session(bot, chat_id, creds, s, state):
                 virt = (f", VIRTUAL mode (real after {s['vneed']} virtual losses, "
                         f"continuous real: {'on' if s['cont'] else 'off'})")
             dur = f"{s['ticks']} ticks, " if s["ticks"] else ""
+            if s["ticks"] and s["mart"] and mts and mtt:
+                dur = (f"{s['ticks']} ticks (then {mtt} ticks from martingale step "
+                       f"{mts}), ")
             await safe_send(
                 bot, chat_id,
                 f"{'FAST session' if fast else 'Session'} started: {s['market']}, {mode}, "
@@ -1386,6 +1469,8 @@ async def run_session(bot, chat_id, creds, s, state):
                 param = pick_param(s, t)
                 label = make_label(s, t, param)
                 per = " per leg" if t in DUAL else ""
+                tk = eff_ticks()
+                ts = s if tk == s["ticks"] else {**s, "ticks": tk}   # this trade's settings
 
                 # ----- virtual trade (type never switches here) -----
                 if s["virtual"] and vloss < s["vneed"]:
@@ -1395,7 +1480,7 @@ async def run_session(bot, chat_id, creds, s, state):
                         last_ping = time.monotonic()
                     vs = virtual_stake(t)
                     try:
-                        vprofit, vdet = await trade_once(vlink, s, t, param, vs, vcur)
+                        vprofit, vdet = await trade_once(vlink, ts, t, param, vs, vcur)
                     except BuyUnknown as e:
                         await say(f"Virtual trade skipped: {e}")
                         continue
@@ -1412,7 +1497,7 @@ async def run_session(bot, chat_id, creds, s, state):
 
                 # ----- real trade (same type as the virtual phase) -----
                 try:
-                    profit, det = await trade_once(link, s, t, param, stake, cur)
+                    profit, det = await trade_once(link, ts, t, param, stake, cur)
                 except BuyUnknown as e:
                     await say(f"REAL trade result unknown: {e} Check your Deriv "
                               "statement. Continuing with the next trade.")
@@ -1456,6 +1541,13 @@ async def run_session(bot, chat_id, creds, s, state):
                             await say("Safety cap reached, stake reset to base.")
                         else:
                             stake = new
+                    nt = eff_ticks()
+                    if nt != cur_ticks and s["ticks"]:
+                        cur_ticks = nt
+                        if nt == s["ticks"]:
+                            await say(f"Martingale step {step}: back to {nt} ticks.")
+                        else:
+                            await say(f"Martingale step {step}: duration now {nt} ticks.")
 
                 # back to virtual or keep trading real
                 if s["virtual"]:
@@ -1587,6 +1679,9 @@ def build_app():
             DUR: [MessageHandler(txt, got_dur)],
             MART: [MessageHandler(txt, got_mart)],
             MULT: [MessageHandler(txt, got_mult)],
+            MTICK: [MessageHandler(txt, got_mtick)],
+            MTSTEP: [MessageHandler(txt, got_mtstep)],
+            MTTICKS: [MessageHandler(txt, got_mtticks)],
             VIRT: [MessageHandler(txt, got_virt)],
             VLOSS: [MessageHandler(txt, got_vloss)],
             CONT: [MessageHandler(txt, got_cont)],
@@ -1613,3 +1708,4 @@ if __name__ == "__main__":
     if not TG_TOKEN:
         raise SystemExit("No Telegram token found in the environment.")
     build_app().run_polling(bootstrap_retries=-1)
+ 
