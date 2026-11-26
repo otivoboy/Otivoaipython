@@ -1447,6 +1447,15 @@ def judge(t, param, ent, ext):
     return won, why
 
 
+class RateLimited(Exception):
+    """Deriv said we are sending requests too fast."""
+
+
+def is_rate_limit(err):
+    text = f"{err.get('code', '')} {err.get('message', '')}".lower()
+    return "ratelimit" in text or "rate limit" in text
+
+
 class TickBook:
     """The latest ticks, numbered in the order they arrived."""
 
@@ -1569,6 +1578,7 @@ async def run_tick_session(bot, chat_id, creds, s, state):
     pending = []                   # open contracts waiting for their verdict
     tasks = set()
     placing = rejects = mism = checked = 0
+    gap, hold_until, last_disp, good, nplaced = 0.0, 0.0, 0.0, 0, 0   # rate-limit pacing
     total, n, wins, vn = 0.0, 0, 0, 0
     base = s["stake"]
     stake, step, idx, vloss = base, 0, 0, 0
@@ -1696,6 +1706,8 @@ async def run_tick_session(bot, chat_id, creds, s, state):
         nonlocal total, mism, checked
         try:
             waited = 0.0
+            if not c["deriv"] and not c["verify"]:
+                return
             while not c["deriv"] and not c.get("settled"):
                 await asyncio.sleep(0.5)
                 waited += 0.5
@@ -1710,6 +1722,8 @@ async def run_tick_session(bot, chat_id, creds, s, state):
                     if p.get("is_sold"):
                         poc = p
                         break
+                    if "error" in r and is_rate_limit(r["error"]):
+                        await asyncio.sleep(3)
                 except Exception:
                     pass
                 await asyncio.sleep(1)
@@ -1747,15 +1761,36 @@ async def run_tick_session(bot, chat_id, creds, s, state):
             if c["deriv"]:
                 calibrating.discard(c["cls"])
 
+    def slow_down():
+        """Deriv's rate limit was hit: pause briefly, then trade less often."""
+        nonlocal gap, hold_until, good
+        old = gap
+        gap = min(max(gap * 1.6, 1.5), 10.0)
+        hold_until = time.monotonic() + 4
+        good = 0
+        if gap != old:
+            say(f"Deriv rate limit reached. Slowing down to one trade every "
+                f"{gap:.1f}s (it speeds up again when things are calm).")
+
     async def place(is_real, t, param, stk, cls, conn, ccur, deriv, label):
-        nonlocal placing, rejects
+        nonlocal placing, rejects, good, gap, nplaced
         try:
             prop = await conn.request(build_proposal(s1, t, param, stk, ccur))
             if "error" in prop:
+                if is_rate_limit(prop["error"]):
+                    raise RateLimited()
                 raise RuntimeError(prop["error"]["message"])
             buy = await conn.request({"buy": prop["proposal"]["id"], "price": stk})
             if "error" in buy:
+                if is_rate_limit(buy["error"]):
+                    raise RateLimited()
                 raise RuntimeError(buy["error"]["message"])
+        except RateLimited:
+            placing -= 1
+            if deriv:
+                calibrating.discard(cls)
+            slow_down()
+            return
         except Exception as e:
             placing -= 1
             if deriv:
@@ -1771,13 +1806,21 @@ async def run_tick_session(bot, chat_id, creds, s, state):
             return
         placing -= 1
         rejects = 0
+        good += 1
+        if gap and good >= 40:                    # calm for a while: speed up a little
+            gap = gap / 1.5 if gap > 1.8 else 0.0
+            good = 0
+        nplaced += 1
         b = buy["buy"]
         c = {"cid": b["contract_id"], "t": t, "param": param, "real": is_real,
              "stake": float(b.get("buy_price", stk)),
              "payout": float(b.get("payout", 0) or 0),
              "start": int(b.get("start_time") or b.get("purchase_time") or time.time()),
              "cls": cls, "label": label, "conn": conn, "deriv": deriv,
-             "t0": time.monotonic()}
+             "t0": time.monotonic(),
+             # double-check with Deriv: every trade at first, then every 5th
+             # (and less often when Deriv is rate limiting) to save requests
+             "verify": nplaced <= 10 or nplaced % (10 if gap else 5) == 0}
         pending.append(c)
         spawn(follow(c))
         resolve_due()
@@ -1886,8 +1929,11 @@ async def run_tick_session(bot, chat_id, creds, s, state):
 
             t = types[idx]
             cls = tick_class(t)
-            if placing + len(pending) >= TICK_OPEN_CAP or cls in calibrating:
+            now = time.monotonic()
+            if (placing + len(pending) >= TICK_OPEN_CAP or cls in calibrating
+                    or now < hold_until or now - last_disp < gap):
                 continue
+            last_disp = now
             is_real = not (s["virtual"] and vloss < s["vneed"])
             param = pick_param(s, t)
             stk = stake if is_real else virtual_stake(t)
@@ -2272,4 +2318,3 @@ if __name__ == "__main__":
     if not TG_TOKEN:
         raise SystemExit("No Telegram token found in the environment.")
     build_app().run_polling(bootstrap_retries=-1)
-  
