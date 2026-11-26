@@ -1,4 +1,4 @@
-import os, json, re, random, time, asyncio, itertools, logging, copy, httpx, websockets
+import os, json, re, random, time, asyncio, itertools, logging, copy, collections, httpx, websockets
 from contextlib import AsyncExitStack
 from websockets.exceptions import ConnectionClosed
 from telegram import Update, BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -24,7 +24,7 @@ API = "https://api.derivws.com/trading/v1/options"
 
 RISK = ("Trading is risky and most users lose money. Martingale can wipe a balance "
         "quickly, and Fast execution opens the next trade the moment the last one "
-        "closes, so losses can pile up quicker. Use a DEMO account first and a Trade-scope-only token. No financial advice and no guarantees.")
+        "closes, and Every-tick mode opens a new trade on every tick, so losses can pile up much quicker. Use a DEMO account first and a Trade-scope-only token. No financial advice and no guarantees.")
 
 
 def _pick_db():
@@ -76,6 +76,11 @@ TYPES = {
     "Dual O5/U4": "DUAL", "Dual H/L": "DUAL",
 }
 TYPE_LOOKUP = {k.lower(): k for k in TYPES}
+TICK_TYPES = ["Differs", "Over", "Under", "Even", "Odd", "Rise", "Fall"]   # allowed in Every-tick mode
+
+
+def allowed_types(s):
+    return TICK_TYPES if s.get("exec") == "tick" else list(TYPES)
 DUAL = {"Dual O5/U4", "Dual H/L"}
 DIGIT_TYPES = {"Differs", "Over", "Under"}
 BARRIER_TYPES = {"Higher", "Lower"}          # need a signed barrier, min 5 ticks
@@ -221,10 +226,13 @@ def describe(s):
     ]
     if s.get("exec") == "fast":
         lines.append("Execution: FAST (next trade opens right after the last closes)")
+    elif s.get("exec") == "tick":
+        lines.append("Execution: EVERY TICK (a 1-tick trade on every tick, result read "
+                     "from the tick digit)")
     else:
         lines.append("Execution: Normal")
     lines.append(f"Stake: {s['stake']}")
-    if s.get("ticks"):
+    if s.get("ticks") and s.get("exec") != "tick":
         d = f"Duration: {s['ticks']} ticks"
         if s.get("mart") and s.get("mart_tick_step") and s.get("mart_ticks"):
             d += f" ({s['mart_ticks']} ticks from martingale step {s['mart_tick_step']})"
@@ -266,7 +274,10 @@ async def help_cmd(update, ctx):
         "Execution modes:\n"
         "- Normal: one contract at a time, with a short pause between trades.\n"
         "- Fast: one contract at a time, but the next one is bought immediately "
-        "after the last one closes, with no pause.\n\n" + RISK)
+        "after the last one closes, with no pause.\n"
+        "- Every tick: a new 1-tick trade opens on EVERY tick (Differs, Over, Under, "
+        "Even, Odd, Rise, Fall only). Win or loss is read from the tick's last digit "
+        "(or price), so martingale and hybrid recover instantly.\n\n" + RISK)
 
 
 async def got_pat(update, ctx):
@@ -560,14 +571,18 @@ async def got_market(update, ctx):
         await update.message.reply_text("Please pick a market from the buttons.")
         return MARKET
     ctx.user_data["s"]["market"] = MARKETS[name]
-    kb = ReplyKeyboardMarkup([["Normal", "Fast"]],
+    kb = ReplyKeyboardMarkup([["Normal", "Fast"], ["Every tick"]],
                              one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
         "Execution speed?\n"
         "- Normal: one contract at a time, with a short pause between trades.\n"
         "- Fast: one contract at a time, but the next contract is bought immediately "
         "after the last one closes (no pause, no extra balance checks), so trades "
-        "come as quickly as the market allows.", reply_markup=kb)
+        "come as quickly as the market allows.\n"
+        "- Every tick: opens a new 1-tick trade on EVERY tick without waiting for the "
+        "last one (Differs, Over, Under, Even, Odd, Rise, Fall only). The bot reads each "
+        "win/loss from the tick itself, e.g. Over 1 wins on a last digit of 2-9.",
+        reply_markup=kb)
     return EXEC
 
 
@@ -589,13 +604,23 @@ async def got_exec(update, ctx):
     if a == "fast":
         s["exec"] = "fast"
         return await ask_mode(update)
-    await update.message.reply_text("Choose Normal or Fast.")
+    if a.startswith("every"):
+        s["exec"] = "tick"
+        return await ask_mode(update)
+    await update.message.reply_text("Choose Normal, Fast or Every tick.")
     return EXEC
 
 
 async def got_mode(update, ctx):
     m = update.message.text.strip().lower()
     if m.startswith("single"):
+        if ctx.user_data["s"].get("exec") == "tick":
+            kb = ReplyKeyboardMarkup(
+                [["Differs", "Over", "Under"], ["Even", "Odd"], ["Rise", "Fall"]],
+                one_time_keyboard=True, resize_keyboard=True)
+            await update.message.reply_text(
+                "Trade type? (Every-tick mode supports these only)", reply_markup=kb)
+            return TTYPE
         kb = ReplyKeyboardMarkup(
             [["Differs", "Over", "Under"], ["Even", "Odd"],
              ["Rise", "Fall"], ["Higher", "Lower"], ["Accumulator"],
@@ -609,7 +634,7 @@ async def got_mode(update, ctx):
         await update.message.reply_text(
             "Send the trade types in order, separated by commas.\n"
             "Example: Over, Under, Dual O5/U4\n\n"
-            f"Options: {', '.join(TYPES)}\n\n"
+            f"Options: {', '.join(allowed_types(ctx.user_data['s']))}\n\n"
             "The bot starts with the first one. After a real loss it moves to the next "
             "(looping back to the first). After a win it stays on the same type.",
             reply_markup=ReplyKeyboardRemove())
@@ -689,6 +714,10 @@ async def got_type(update, ctx):
     if t is None:
         await update.message.reply_text("Pick a trade type from the buttons.")
         return TTYPE
+    if t not in allowed_types(ctx.user_data["s"]):
+        await update.message.reply_text(
+            f"Every-tick mode only supports: {', '.join(TICK_TYPES)}.")
+        return TTYPE
     set_types(ctx.user_data["s"], [t])
     return await next_param(update, ctx)
 
@@ -699,7 +728,11 @@ async def got_htypes(update, ctx):
     if None in parts or len(parts) < 2:
         await update.message.reply_text(
             "Send at least 2 valid types separated by commas, e.g. Over, Under, Dual H/L.\n"
-            f"Valid: {', '.join(TYPES)}")
+            f"Valid: {', '.join(allowed_types(ctx.user_data['s']))}")
+        return HTYPES
+    if any(p not in allowed_types(ctx.user_data["s"]) for p in parts):
+        await update.message.reply_text(
+            f"Every-tick mode only supports: {', '.join(TICK_TYPES)}. Send the list again.")
         return HTYPES
     set_types(ctx.user_data["s"], parts)
     return await next_param(update, ctx)
@@ -784,6 +817,9 @@ async def got_stake(update, ctx):
         await update.message.reply_text(f"Enter a number from {minimum:g} to {MAX_STAKE}.")
         return STAKE
     s["stake"] = v
+    if s.get("exec") == "tick":      # Every-tick trades are always 1 tick
+        s["ticks"] = 1
+        return await ask_mart(update)
     if needs_duration(s):
         lo_t = min_ticks(s)
         note = " (Higher/Lower needs 5+)" if lo_t == 5 else ""
@@ -843,7 +879,7 @@ async def got_mult(update, ctx):
 
 async def ask_mtick(update, ctx):
     s = ctx.user_data["s"]
-    if not needs_duration(s):          # accumulator only: no duration to change
+    if s.get("exec") == "tick" or not needs_duration(s):   # no duration to change
         s["mart_tick_step"] = 0
         return await ask_virtual(update)
     kb = ReplyKeyboardMarkup([["Yes", "No"]], one_time_keyboard=True, resize_keyboard=True)
@@ -1368,12 +1404,540 @@ class Reporter:
             await safe_send(self.bot, self.chat_id, chunk)
 
 
+# ---------- TRADE ON EVERY TICK ----------
+# One 1-tick contract is opened on EVERY tick, without waiting for the earlier ones
+# to close. With several contracts open at once, asking Deriv "did the last trade
+# win?" is too slow, so the bot reads the settling tick itself:
+#   Differs: last digit is NOT your digit    Over: last digit > your digit
+#   Under:   last digit < your digit         Even / Odd: last digit even / odd
+#   Rise:    exit price > entry price        Fall: exit price < entry price
+# That verdict drives martingale, hybrid and virtual mode straight away. Deriv's own
+# result is fetched afterwards only to double check the bot's reading (and to fix
+# it, and the P/L, if it ever disagrees).
+TICK_OPEN_CAP = 6        # most contracts open at the same time in this mode
+DEFAULT_OFFS = {"digit": (0, 0), "rf": (0, 1)}   # used only if learning fails 3 times
+
+
+def tick_class(t):
+    return "rf" if t in ("Rise", "Fall") else "digit"
+
+
+def last_digit(quote, pip):
+    return int(f"{float(quote):.{int(pip)}f}"[-1])
+
+
+def judge(t, param, ent, ext):
+    """ent / ext are (idx, epoch, quote, digit). Returns (won, why)."""
+    d = ext[3]
+    if t == "Differs":
+        won = d != int(param)
+    elif t == "Over":
+        won = d > int(param)
+    elif t == "Under":
+        won = d < int(param)
+    elif t == "Even":
+        won = d % 2 == 0
+    elif t == "Odd":
+        won = d % 2 == 1
+    elif t == "Rise":
+        won = ext[2] > ent[2]
+    else:                                   # Fall
+        won = ext[2] < ent[2]
+    why = f"{ent[2]:g}>{ext[2]:g}" if t in ("Rise", "Fall") else f"digit {d}"
+    return won, why
+
+
+class TickBook:
+    """The latest ticks, numbered in the order they arrived."""
+
+    def __init__(self):
+        self.n = 0
+        self.buf = collections.deque(maxlen=500)
+
+    def add(self, tk):
+        try:
+            ep = int(tk["epoch"])
+            if self.buf and ep <= self.buf[-1][1]:
+                return None
+            row = (self.n, ep, float(tk["quote"]),
+                   last_digit(tk["quote"], tk.get("pip_size", 2)))
+        except Exception:
+            return None
+        self.n += 1
+        self.buf.append(row)
+        return row
+
+    def by_idx(self, i):
+        j = i - (self.n - len(self.buf))
+        return self.buf[j] if 0 <= j < len(self.buf) else None
+
+    def idx_after(self, epoch):
+        """Index of the first tick that came AFTER this epoch (None if not here yet)."""
+        for row in self.buf:
+            if row[1] > epoch:
+                return row[0]
+        return None
+
+    def idx_at(self, epoch):
+        for row in reversed(self.buf):
+            if row[1] == epoch:
+                return row[0]
+            if row[1] < epoch:
+                break
+        return None
+
+
+class Conn:
+    """A websocket with ONE reader task, so many requests can be in flight at the
+    same time. Each answer is matched to its request by req_id."""
+
+    def __init__(self, acc, pat, label, on_tick=None):
+        self.acc, self.pat, self.label, self.on_tick = acc, pat, label, on_tick
+        self.ws = None
+        self.reader = None
+        self.pending = {}
+        self.dead = asyncio.Event()
+
+    async def open(self):
+        url = await get_ws_url(self.acc, self.pat)
+        self.ws = await websockets.connect(url)
+        self.dead.clear()
+        self.reader = asyncio.create_task(self._read())
+
+    async def close(self):
+        r, self.reader = self.reader, None
+        if r is not None:
+            r.cancel()
+            try:
+                await r
+            except (asyncio.CancelledError, Exception):
+                pass
+        ws, self.ws = self.ws, None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        self.dead.set()
+
+    async def _read(self):
+        try:
+            async for raw in self.ws:
+                try:
+                    m = json.loads(raw)
+                except Exception:
+                    continue
+                if self.on_tick and isinstance(m.get("tick"), dict):
+                    self.on_tick(m["tick"])
+                rid = m.get("req_id")
+                fut = self.pending.pop(rid, None) if rid is not None else None
+                if fut is not None and not fut.done():
+                    fut.set_result(m)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        finally:
+            for f in self.pending.values():
+                if not f.done():
+                    f.set_exception(ConnectionError("link closed"))
+            self.pending.clear()
+            self.dead.set()
+
+    async def request(self, req, timeout=20):
+        if self.ws is None or self.dead.is_set():
+            raise ConnectionError("link closed")
+        rid = next(RID)
+        fut = asyncio.get_running_loop().create_future()
+        self.pending[rid] = fut
+        try:
+            await self.ws.send(json.dumps({**req, "req_id": rid}))
+            return await asyncio.wait_for(fut, timeout)
+        except Exception:
+            self.pending.pop(rid, None)
+            raise
+
+
+async def run_tick_session(bot, chat_id, creds, s, state):
+    rep = Reporter(bot, chat_id)
+    say = rep.add
+    book = TickBook()
+    tick_q = asyncio.Queue()
+    offs = {}                      # contract class -> (entry offset, exit offset)
+    cal_fail = {"digit": 0, "rf": 0}
+    calibrating = set()            # classes waiting for Deriv to confirm one trade
+    pending = []                   # open contracts waiting for their verdict
+    tasks = set()
+    placing = rejects = mism = checked = 0
+    total, n, wins, vn = 0.0, 0, 0, 0
+    base = s["stake"]
+    stake, step, idx, vloss = base, 0, 0, 0
+    types = s["types"]
+    s1 = {**s, "ticks": 1}
+    cur = vcur = ""
+    last_bal = None
+    drops = []
+    last_vping = 0.0
+    rconn = vconn = flusher = None
+
+    def on_tick(tk):
+        row = book.add(tk)
+        if row:
+            tick_q.put_nowait(row)
+
+    def spawn(coro):
+        task = asyncio.create_task(coro)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    # ----- one verdict -> martingale / hybrid / virtual / TP / SL -----
+    def settle(c, won, profit, why):
+        nonlocal total, n, wins, vn, vloss, idx, stake, step
+        if not c["real"]:
+            vn += 1
+            before = vloss
+            if before < s["vneed"]:          # ignore late virtual results in the real phase
+                vloss = 0 if won else vloss + 1
+            say(f"V#{vn} {c['label']} (virtual {c['stake']}): "
+                f"{'WIN' if won else 'LOSS'} [{why}] | virtual losses {vloss}/{s['vneed']}")
+            if before < s["vneed"] <= vloss:
+                say("Virtual loss target reached. Next trade is REAL.")
+            return
+        total += profit
+        n += 1
+        wins += int(won)
+        say(f"#{n} REAL {c['label']} (stake {c['stake']}): "
+            f"{'WIN' if won else 'LOSS'} {profit:+.2f} [{why}] | Total {total:+.2f} {cur}")
+        if not state["stop"]:
+            if total >= s["tp"]:
+                say("Take profit reached. Session ended.")
+                state["stop"] = True
+            elif total <= -s["sl"]:
+                say("Stop loss reached. Session ended.")
+                state["stop"] = True
+        if not won and len(types) > 1:           # switch type only after a REAL loss
+            idx = (idx + 1) % len(types)
+            say(f"Real loss, switching to {types[idx]}")
+        if s["mart"]:
+            if won:
+                step, stake = 0, base
+            else:
+                step += 1
+                new = round(base * (s["mult"] ** step), 2)
+                if new > MAX_MART_STAKE:
+                    step, stake = 0, base
+                    say("Safety cap reached, stake reset to base.")
+                else:
+                    stake = new
+        if s["virtual"]:
+            if won:
+                vloss = 0
+                say("Real win, back to virtual mode.")
+            elif s["cont"]:
+                say("Real loss, continuing real trades until a win.")
+            else:
+                vloss = 0
+                say("Back to virtual mode.")
+
+    # ----- read the verdict from the ticks -----
+    def verdict(c):
+        i0 = book.idx_after(c["start"])
+        if i0 is None:
+            return None
+        eo, xo = offs[c["cls"]]
+        ent, ext = book.by_idx(i0 + eo), book.by_idx(i0 + xo)
+        if ent is None or ext is None:
+            return None
+        return judge(c["t"], c["param"], ent, ext)
+
+    def resolve_due():
+        for c in list(pending):
+            if c["deriv"]:
+                continue                      # waiting for Deriv's answer (calibration)
+            v = verdict(c)
+            if v is None:
+                if time.monotonic() - c["t0"] > 90:
+                    pending.remove(c)
+                    c["gone"] = True
+                    say(f"{c['label']}: result unknown (no settling tick). "
+                        "Check your Deriv statement.")
+                continue
+            won, why = v
+            profit = round(c["payout"] - c["stake"], 2) if won else -c["stake"]
+            c["local"], c["lprofit"], c["settled"] = won, profit, True
+            pending.remove(c)
+            settle(c, won, profit, why)
+
+    def learn(c, poc):
+        """Work out, from Deriv's own entry and exit tick times, which ticks
+        settle this kind of contract."""
+        try:
+            i0 = book.idx_after(c["start"])
+            ie = book.idx_at(int(poc["entry_tick_time"]))
+            ix = book.idx_at(int(poc["exit_tick_time"]))
+            if i0 is None or ie is None or ix is None:
+                return False
+            eo, xo = ie - i0, ix - i0
+            if not (0 <= eo <= 3 and 0 <= xo <= 3 and xo >= eo):
+                return False
+        except Exception:
+            return False
+        old = offs.get(c["cls"])
+        offs[c["cls"]] = (eo, xo)
+        if old is None:
+            say(f"Tick alignment learned for {c['cls']} contracts "
+                f"(entry +{eo}, exit +{xo}).")
+        elif old != (eo, xo):
+            say(f"Tick alignment corrected for {c['cls']} contracts "
+                f"(entry +{eo}, exit +{xo}).")
+        return True
+
+    async def follow(c):
+        nonlocal total, mism, checked
+        try:
+            waited = 0.0
+            while not c["deriv"] and not c.get("settled"):
+                await asyncio.sleep(0.5)
+                waited += 0.5
+                if waited > 100 or c.get("gone"):
+                    return
+            poc = None
+            for _ in range(10):
+                try:
+                    r = await c["conn"].request(
+                        {"proposal_open_contract": 1, "contract_id": c["cid"]})
+                    p = r.get("proposal_open_contract") or {}
+                    if p.get("is_sold"):
+                        poc = p
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+            if poc is None:
+                if c["deriv"] and c in pending:
+                    pending.remove(c)
+                    c["gone"] = True
+                    say(f"{c['label']}: could not get Deriv's result. Check your statement.")
+                return
+            dprofit = float(poc.get("profit") or 0)
+            dwon = dprofit > 0
+            if c["deriv"]:
+                if c in pending:
+                    pending.remove(c)
+                if not learn(c, poc):
+                    cal_fail[c["cls"]] += 1
+                    if cal_fail[c["cls"]] >= 3:
+                        offs[c["cls"]] = DEFAULT_OFFS[c["cls"]]
+                        say(f"Could not learn the tick alignment for {c['cls']} "
+                            "contracts, using the default one.")
+                settle(c, dwon, dprofit, "confirmed by Deriv")
+            else:
+                checked += 1
+                if dwon != c["local"]:
+                    mism += 1
+                    if c["real"]:
+                        total += dprofit - c["lprofit"]
+                    say(f"CHECK {c['label']}: the bot read "
+                        f"{'WIN' if c['local'] else 'LOSS'} but Deriv says "
+                        f"{'WIN' if dwon else 'LOSS'} ({dprofit:+.2f}). Fixing the tick "
+                        "alignment.")
+                    if not learn(c, poc):
+                        offs.pop(c["cls"], None)    # next trade of this kind re-learns
+        finally:
+            if c["deriv"]:
+                calibrating.discard(c["cls"])
+
+    async def place(is_real, t, param, stk, cls, conn, ccur, deriv, label):
+        nonlocal placing, rejects
+        try:
+            prop = await conn.request(build_proposal(s1, t, param, stk, ccur))
+            if "error" in prop:
+                raise RuntimeError(prop["error"]["message"])
+            buy = await conn.request({"buy": prop["proposal"]["id"], "price": stk})
+            if "error" in buy:
+                raise RuntimeError(buy["error"]["message"])
+        except Exception as e:
+            placing -= 1
+            if deriv:
+                calibrating.discard(cls)
+            if is_conn_error(e):
+                say(f"Trade skipped, connection problem ({e or type(e).__name__}).")
+            else:
+                rejects += 1
+                say(f"Trade rejected: {e}")
+                if rejects >= 5:
+                    say("Too many rejected trades in a row, stopping.")
+                    state["stop"] = True
+            return
+        placing -= 1
+        rejects = 0
+        b = buy["buy"]
+        c = {"cid": b["contract_id"], "t": t, "param": param, "real": is_real,
+             "stake": float(b.get("buy_price", stk)),
+             "payout": float(b.get("payout", 0) or 0),
+             "start": int(b.get("start_time") or b.get("purchase_time") or time.time()),
+             "cls": cls, "label": label, "conn": conn, "deriv": deriv,
+             "t0": time.monotonic()}
+        pending.append(c)
+        spawn(follow(c))
+        resolve_due()
+
+    async def reopen(conn):
+        nonlocal drops
+        now = time.monotonic()
+        drops = [x for x in drops if now - x < 300] + [now]
+        if len(drops) > MAX_DROPS:
+            raise ConnectionError(
+                f"{conn.label} dropped {len(drops)} times in 5 minutes, giving up.")
+        say(f"{conn.label} connection lost. Reconnecting...")
+        delay = 1
+        for _ in range(RECONNECT_TRIES):
+            if state["stop"]:
+                raise StopSession()
+            try:
+                await conn.close()
+                await conn.open()
+                if conn is rconn:
+                    sub = await conn.request({"ticks": s["market"], "subscribe": 1})
+                    if "error" in sub:
+                        raise RuntimeError(sub["error"]["message"])
+                say(f"{conn.label} reconnected.")
+                return
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (400, 401, 403, 404):
+                    raise Exception(f"{conn.label} login was rejected while reconnecting "
+                                    f"({e.response.status_code}). Check your token: "
+                                    "/logout then /start.")
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
+        raise ConnectionError(f"Could not reconnect {conn.label}.")
+
+    async def ping(conn):
+        try:
+            await conn.request({"ping": 1})
+        except Exception:
+            pass
+
+    async def flush_loop():
+        k, last = 0, -1
+        while True:
+            await asyncio.sleep(4)
+            k += 1
+            if k % 4 == 0 and n + vn != last:
+                last = n + vn
+                v = f" | Virtual {vn}" if s["virtual"] else ""
+                rep.add(f"STATS Runs {n} | Won {wins} | Lost {n - wins} | "
+                        f"P/L {total:+.2f} {cur} | Stake {stake}{v}")
+            await rep.flush()
+
+    try:
+        rconn = Conn(creds["acc"], creds["pat"], "Real account", on_tick)
+        await rconn.open()
+        b = await rconn.request({"balance": 1})
+        if "error" in b:
+            raise Exception(b["error"]["message"])
+        last_bal, cur = float(b["balance"]["balance"]), b["balance"]["currency"]
+        sub = await rconn.request({"ticks": s["market"], "subscribe": 1})
+        if "error" in sub:
+            raise Exception(f"Could not start the tick stream: {sub['error']['message']}")
+        if s["virtual"]:
+            vconn = Conn(VIRTUAL_ACC, VIRTUAL_PAT, "Virtual account")
+            await vconn.open()
+            vb = await vconn.request({"balance": 1})
+            vcur = vb["balance"]["currency"]
+
+        mode = "Hybrid: " + " > ".join(types) if len(types) > 1 else types[0]
+        mart = f", martingale x{s['mult']}" if s["mart"] else ""
+        virt = ""
+        if s["virtual"]:
+            virt = (f", VIRTUAL mode (real after {s['vneed']} virtual losses, "
+                    f"continuous real: {'on' if s['cont'] else 'off'})")
+        await safe_send(
+            bot, chat_id,
+            f"EVERY-TICK session started: {s['market']}, {mode}, 1 tick, "
+            f"stake {base} {cur}{mart}{virt}, TP {s['tp']}, SL {s['sl']}.\n"
+            f"Balance: {last_bal:,.2f} {cur}\n"
+            "A new trade opens on every tick. Win or loss is read from the tick itself "
+            "(for Over 1, a last digit of 2-9 is a win), then double checked with Deriv. "
+            "The first trade of each kind waits for Deriv to confirm it, to learn how the "
+            "ticks line up. Send /stop to end.")
+        flusher = asyncio.create_task(flush_loop())
+
+        while not state["stop"]:
+            for conn in (rconn, vconn):
+                if conn is not None and conn.dead.is_set():
+                    await reopen(conn)
+            try:
+                await asyncio.wait_for(tick_q.get(), 20)
+            except asyncio.TimeoutError:
+                say("No tick for 20 seconds, reconnecting.")
+                rconn.dead.set()
+                continue
+            while not tick_q.empty():            # only the newest tick matters
+                tick_q.get_nowait()
+            resolve_due()                        # verdicts first, so the next trade is up to date
+            if state["stop"]:
+                break
+            if vconn is not None and time.monotonic() - last_vping > 30:
+                last_vping = time.monotonic()
+                spawn(ping(vconn))
+
+            t = types[idx]
+            cls = tick_class(t)
+            if placing + len(pending) >= TICK_OPEN_CAP or cls in calibrating:
+                continue
+            is_real = not (s["virtual"] and vloss < s["vneed"])
+            param = pick_param(s, t)
+            stk = stake if is_real else virtual_stake(t)
+            deriv = cls not in offs
+            if deriv:
+                calibrating.add(cls)
+            placing += 1
+            spawn(place(is_real, t, param, stk, cls, rconn if is_real else vconn,
+                        cur if is_real else vcur, deriv, make_label(s, t, param)))
+
+        end = time.monotonic() + 25               # no new trades; let the open ones finish
+        while (pending or placing or calibrating) and time.monotonic() < end:
+            await asyncio.sleep(0.5)
+            resolve_due()
+        try:
+            r = await rconn.request({"balance": 1})
+            last_bal = float(r["balance"]["balance"])
+        except Exception:
+            pass
+    except StopSession:
+        pass
+    except Exception as e:
+        logging.warning("Tick session error: %s", e)
+        say(f"Error: {e}")
+    finally:
+        if flusher:
+            flusher.cancel()
+        for task in list(tasks):
+            task.cancel()
+        for conn in (rconn, vconn):
+            if conn is not None:
+                await conn.close()
+    await rep.flush()
+    extra = f", {vn} virtual trades" if s["virtual"] else ""
+    bal_txt = f"\nBalance: {last_bal:,.2f} {cur}" if last_bal is not None else ""
+    await safe_send(bot, chat_id,
+                    f"Summary (EVERY TICK): {n} real trades, {wins} wins, "
+                    f"total {total:+.2f} {cur}{extra}.\n"
+                    f"Deriv double check: {checked} trades checked, {mism} disagreed."
+                    f"{bal_txt}\n/trade to start again.")
+
+
 # ---------- trading loop (Normal and Fast) ----------
 # Both modes place ONE contract at a time. Normal pauses 1s between trades and
 # checks the balance after every trade. Fast buys the next contract the moment
 # the previous one closes, skips the balance check, and sends its Telegram
 # messages in batches so Telegram's rate limit never slows the trading.
 async def run_session(bot, chat_id, creds, s, state):
+    if s.get("exec") == "tick":
+        return await run_tick_session(bot, chat_id, creds, s, state)
     fast = s.get("exec") == "fast"
     rep = Reporter(bot, chat_id) if fast else None
 
@@ -1708,4 +2272,4 @@ if __name__ == "__main__":
     if not TG_TOKEN:
         raise SystemExit("No Telegram token found in the environment.")
     build_app().run_polling(bootstrap_retries=-1)
- 
+  
